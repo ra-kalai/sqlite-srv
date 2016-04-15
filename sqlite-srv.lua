@@ -21,6 +21,7 @@ local lfs = require 'lem.lfs'
 local io = require 'lem.io'
 local utils = require 'lem.utils'
 local spawn = utils.spawn
+local new_thread_queue = utils.new_thread_queue
 
 local args = {
 	last_arg = "",
@@ -69,7 +70,9 @@ if db == nil then
 end
 
 
-local function sqlite_srv_prepared_query(query, v)
+local cmd_queue = new_thread_queue()
+
+local function sqlite_srv_direct_prepared_query(query, v)
 	local stmt, err = db:prepare(query)
 
 	if stmt then
@@ -86,28 +89,61 @@ local function sqlite_srv_prepared_query(query, v)
 	return {'err', err}
 end
 
+local function sqlite_srv_prepared_query(query, v)
+	return cmd_queue:append(function ()
+		return sqlite_srv_direct_prepared_query(query, v)
+	end)
+end
+
 local function sqlite_srv_fetchall(query, v)
-	local ok, msg = db:fetchall(query, v)
-	if not ok then
-		return {'err', msg}
-	end
-	return {'ok', ok}
+	local ret = cmd_queue:append(function ()
+		local ok, msg = db:fetchall(query, v)
+		if not ok then
+			return {'err', msg}
+		end
+		return {'ok', ok}
+	end)
+
+  return ret
 end
 
 local function sqlite_srv_exec(sql)
-	local ok, msg = db:exec(sql)
-	if not ok then
-		return {'err', msg}
-	end
-	return {'ok', ok}
+	return cmd_queue:append(function ()
+		local ok, msg = db:exec(sql)
+		if not ok then
+			return {'err', msg}
+		end
+		return {'ok', ok}
+	end)
 end
 
 local function sqlite_srv_close()
-	db:close()
-	spawn(function () os.exit(0) end)
-	return {'ok'}
+	return cmd_queue:append(function ()
+		db:close()
+		spawn(function () os.exit(0) end)
+		return {'ok'}
+	end)
 end
 
+local function sqlite_srv_wrap_prepared_query_in_transaction(prepared_query_list)
+	return cmd_queue:append(function ()
+		local ok, msg = db:exec('BEGIN TRANSACTION;')
+		if not ok then
+			ret = {'err', msg}
+			return
+		end
+
+		for i=1,#prepared_query_list do
+			local query = prepared_query_list[i]
+			sqlite_srv_direct_prepared_query(query[1], query[2])
+		end
+
+		local ok, msg = db:exec('COMMIT;')
+		if not ok then
+			ret = {'err', msg}
+		end
+	end)
+end
 
 if g_http_rest_api ~= '' then --% {
 	local hathaway = require 'lem.hathaway'
@@ -169,17 +205,33 @@ if g_socket_uri ~= '' then --% {
 	local lrpc = require 'lem.lrpc'
 	lrpc.server.import()
 
+	local function rpc_single_arity_wrap(fun)
+		local m = fun
+		return function (arg)
+			m(arg.query, arg.args)
+		end
+	end
+
+	declare_rpc_fun('fast_prepared_query', rpc_single_arity_wrap(sqlite_srv_prepared_query))
+	declare_rpc_fun('fast_fetchall', rpc_single_arity_wrap(sqlite_srv_fetchall))
+	declare_rpc_fun('fast_exec', rpc_single_arity_wrap(sqlite_srv_exec))
+	declare_rpc_fun('fast_close', rpc_single_arity_wrap(sqlite_srv_close))
 
 	declare_rpc_fun('prepared_query', sqlite_srv_prepared_query)
+	declare_rpc_fun('wrap_prepared_query_in_transaction', sqlite_srv_wrap_prepared_query_in_transaction)
 	declare_rpc_fun('fetchall', sqlite_srv_fetchall)
 	declare_rpc_fun('exec', sqlite_srv_exec)
 	declare_rpc_fun('close', sqlite_srv_close)
-	local run, err, extra = run_rpc_server(g_socket_uri)
 
-	if not run then
-		io.stderr:write(
-			format("socket binding problem [%s] err: ( %s - %s) ; check perm\n",
-			g_socket_uri, err, extra))
-		os.exit(2)
-	end
+	print('rpc-server starting')
+	spawn(function ()
+		local run, err, extra = run_rpc_server(g_socket_uri)
+
+		if not run then
+			io.stderr:write(
+				format("socket binding problem [%s] err: ( %s - %s) ; check perm\n",
+					g_socket_uri, err, extra))
+			os.exit(2)
+		end
+	end)
 end --% }
